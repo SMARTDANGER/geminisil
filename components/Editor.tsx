@@ -402,7 +402,10 @@ export default function Editor({
     return () => window.removeEventListener("keydown", onKey);
   }, [undo, redo, fitToStage, runFix]);
 
-  const frameTransform = `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${zoom})`;
+  // `-50%` is applied BEFORE scale so the centering offset scales with the zoom.
+  // (`translate(-50%)` uses the element's *unscaled* size; if it's outermost, a
+  // zoom < 1 overshoots and shoves the image to the top-left.)
+  const frameTransform = `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) translate(-50%, -50%)`;
 
   const wrapCursor =
     tool === "hand" ? (panning.current ? "grabbing" : "grab") : "none";

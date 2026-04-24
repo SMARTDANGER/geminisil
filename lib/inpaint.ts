@@ -1,6 +1,13 @@
-// Self-contained inpainting. Chamfer-ordered FMM-lite fill with weighted
-// neighborhood average, then a small smoothing pass. Runs fully client-side
-// at the source resolution.
+// Exemplar patch-based inpainting. For each boundary pixel (masked with at
+// least one known neighbor) we search a local window for the 9x9 patch that
+// best matches the known portion of the target patch, then copy that patch
+// into the masked positions. This gives real texture instead of radial smear.
+//
+// Inspired by Criminisi et al. (2003), simplified:
+//   - confidence-ordered boundary processing
+//   - fully-known source patches only (expanding search radius)
+//   - greedy SSD match with early termination
+//   - averaging fallback for patches with no valid source
 
 export interface InpaintOptions {
   srcCanvas: HTMLCanvasElement;
@@ -21,134 +28,268 @@ function buildMaskFlags(
   return flags;
 }
 
-function chamferDistance(
-  flags: Uint8Array,
-  w: number,
-  h: number
-): Float32Array {
-  const INF = 1e9;
-  const d = new Float32Array(w * h);
-  for (let i = 0; i < d.length; i++) d[i] = flags[i] ? INF : 0;
-
+function findBoundary(flags: Uint8Array, w: number, h: number): number[] {
+  const out: number[] = [];
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
       if (!flags[i]) continue;
-      let m = d[i];
-      if (x > 0) m = Math.min(m, d[i - 1] + 3);
-      if (y > 0) m = Math.min(m, d[i - w] + 3);
-      if (x > 0 && y > 0) m = Math.min(m, d[i - w - 1] + 4);
-      if (x < w - 1 && y > 0) m = Math.min(m, d[i - w + 1] + 4);
-      d[i] = m;
+      const hasKnownNb =
+        (x > 0 && !flags[i - 1]) ||
+        (x < w - 1 && !flags[i + 1]) ||
+        (y > 0 && !flags[i - w]) ||
+        (y < h - 1 && !flags[i + w]);
+      if (hasKnownNb) out.push(i);
     }
   }
-  for (let y = h - 1; y >= 0; y--) {
-    for (let x = w - 1; x >= 0; x--) {
-      const i = y * w + x;
-      if (!flags[i]) continue;
-      let m = d[i];
-      if (x < w - 1) m = Math.min(m, d[i + 1] + 3);
-      if (y < h - 1) m = Math.min(m, d[i + w] + 3);
-      if (x < w - 1 && y < h - 1) m = Math.min(m, d[i + w + 1] + 4);
-      if (x > 0 && y < h - 1) m = Math.min(m, d[i + w - 1] + 4);
-      d[i] = m;
-    }
-  }
-  return d;
+  return out;
 }
 
-async function fmmFill(
-  pixels: Uint8ClampedArray,
+function patchConfidence(
   flags: Uint8Array,
   w: number,
   h: number,
-  onProgress?: (p: number) => void
-): Promise<void> {
-  const d = chamferDistance(flags, w, h);
-
-  const maskedIndices: number[] = [];
-  for (let i = 0; i < flags.length; i++) if (flags[i]) maskedIndices.push(i);
-  maskedIndices.sort((a, b) => d[a] - d[b]);
-
-  const known = new Uint8Array(flags.length);
-  for (let i = 0; i < flags.length; i++) known[i] = flags[i] ? 0 : 1;
-
-  const R = 4;
-  const total = maskedIndices.length || 1;
-  const chunk = Math.max(2000, Math.floor(total / 40));
-
-  for (let k = 0; k < maskedIndices.length; k++) {
-    const idx = maskedIndices[k];
-    const x = idx % w;
-    const y = (idx / w) | 0;
-
-    let rSum = 0, gSum = 0, bSum = 0, wSum = 0;
-
-    for (let dy = -R; dy <= R; dy++) {
-      const yy = y + dy;
-      if (yy < 0 || yy >= h) continue;
-      for (let dx = -R; dx <= R; dx++) {
-        const xx = x + dx;
-        if (xx < 0 || xx >= w) continue;
-        if (dx === 0 && dy === 0) continue;
-        const j = yy * w + xx;
-        if (!known[j]) continue;
-        const dist2 = dx * dx + dy * dy;
-        if (dist2 > R * R) continue;
-        const weight = 1 / (dist2 + 0.5);
-        const p = j * 4;
-        rSum += pixels[p] * weight;
-        gSum += pixels[p + 1] * weight;
-        bSum += pixels[p + 2] * weight;
-        wSum += weight;
-      }
-    }
-
-    const p = idx * 4;
-    if (wSum > 0) {
-      pixels[p] = rSum / wSum;
-      pixels[p + 1] = gSum / wSum;
-      pixels[p + 2] = bSum / wSum;
-      pixels[p + 3] = 255;
-    } else {
-      pixels[p + 3] = 255;
-    }
-    known[idx] = 1;
-
-    if (onProgress && k % chunk === 0) {
-      onProgress(k / total);
-      await new Promise((r) => setTimeout(r, 0));
+  cx: number,
+  cy: number,
+  R: number
+): number {
+  let known = 0;
+  let total = 0;
+  for (let dy = -R; dy <= R; dy++) {
+    const yy = cy + dy;
+    if (yy < 0 || yy >= h) continue;
+    for (let dx = -R; dx <= R; dx++) {
+      const xx = cx + dx;
+      if (xx < 0 || xx >= w) continue;
+      total++;
+      if (!flags[yy * w + xx]) known++;
     }
   }
-  if (onProgress) onProgress(1);
+  return total > 0 ? known / total : 0;
 }
 
-function smoothFilled(
-  pixels: Uint8ClampedArray,
+function searchBestPatch(
+  px: Uint8ClampedArray,
   flags: Uint8Array,
   w: number,
   h: number,
-  iterations: number
-): void {
-  const tmp = new Uint8ClampedArray(pixels.length);
-  for (let it = 0; it < iterations; it++) {
-    tmp.set(pixels);
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        const i = y * w + x;
-        if (!flags[i]) continue;
-        const p = i * 4;
-        let r = 0, g = 0, b = 0, c = 0;
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const q = ((y + dy) * w + (x + dx)) * 4;
-            r += tmp[q]; g += tmp[q + 1]; b += tmp[q + 2]; c++;
+  cx: number,
+  cy: number,
+  R: number,
+  SR: number,
+  stride: number
+): { bx: number; by: number; err: number } | null {
+  let bestErr = Infinity;
+  let bestX = -1;
+  let bestY = -1;
+
+  const xmin = Math.max(R, cx - SR);
+  const xmax = Math.min(w - R - 1, cx + SR);
+  const ymin = Math.max(R, cy - SR);
+  const ymax = Math.min(h - R - 1, cy + SR);
+
+  for (let sy = ymin; sy <= ymax; sy += stride) {
+    for (let sx = xmin; sx <= xmax; sx += stride) {
+      if (sx === cx && sy === cy) continue;
+
+      // require source patch fully in known region
+      let sourceValid = true;
+      for (let dy = -R; dy <= R && sourceValid; dy++) {
+        const row = (sy + dy) * w;
+        for (let dx = -R; dx <= R; dx++) {
+          if (flags[row + sx + dx]) {
+            sourceValid = false;
+            break;
           }
         }
-        pixels[p] = r / c;
-        pixels[p + 1] = g / c;
-        pixels[p + 2] = b / c;
       }
+      if (!sourceValid) continue;
+
+      // SSD over target's KNOWN positions only
+      let err = 0;
+      let overlap = 0;
+      let aborted = false;
+      for (let dy = -R; dy <= R && !aborted; dy++) {
+        const ty = cy + dy;
+        if (ty < 0 || ty >= h) continue;
+        const srcRow = (sy + dy) * w;
+        const tgtRow = ty * w;
+        for (let dx = -R; dx <= R; dx++) {
+          const tx = cx + dx;
+          if (tx < 0 || tx >= w) continue;
+          const ti = tgtRow + tx;
+          if (flags[ti]) continue;
+          const si = srcRow + sx + dx;
+          const tp = ti << 2;
+          const sp = si << 2;
+          const rd = px[tp] - px[sp];
+          const gd = px[tp + 1] - px[sp + 1];
+          const bd = px[tp + 2] - px[sp + 2];
+          err += rd * rd + gd * gd + bd * bd;
+          overlap++;
+          if (err >= bestErr) {
+            aborted = true;
+            break;
+          }
+        }
+      }
+      if (!aborted && overlap > 0 && err < bestErr) {
+        bestErr = err;
+        bestX = sx;
+        bestY = sy;
+      }
+    }
+  }
+
+  if (bestX < 0) return null;
+  return { bx: bestX, by: bestY, err: bestErr };
+}
+
+function findBestPatch(
+  px: Uint8ClampedArray,
+  flags: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  R: number
+): { bx: number; by: number } | null {
+  // expanding search: local first (cheap + preserves texture locality),
+  // then wider if no fully-known patch nearby.
+  const schedule: Array<[number, number]> = [
+    [48, 2],
+    [128, 3],
+    [320, 4],
+    [Math.max(w, h), 6],
+  ];
+  for (const [SR, stride] of schedule) {
+    const r = searchBestPatch(px, flags, w, h, cx, cy, R, SR, stride);
+    if (r) return r;
+  }
+  return null;
+}
+
+function copyPatch(
+  px: Uint8ClampedArray,
+  flags: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  sx: number,
+  sy: number,
+  R: number
+): number {
+  let filled = 0;
+  for (let dy = -R; dy <= R; dy++) {
+    const ty = cy + dy;
+    if (ty < 0 || ty >= h) continue;
+    const srcRow = (sy + dy) * w;
+    const tgtRow = ty * w;
+    for (let dx = -R; dx <= R; dx++) {
+      const tx = cx + dx;
+      if (tx < 0 || tx >= w) continue;
+      const ti = tgtRow + tx;
+      if (!flags[ti]) continue; // preserve known pixels
+      const si = srcRow + sx + dx;
+      const tp = ti << 2;
+      const sp = si << 2;
+      px[tp] = px[sp];
+      px[tp + 1] = px[sp + 1];
+      px[tp + 2] = px[sp + 2];
+      px[tp + 3] = 255;
+      flags[ti] = 0;
+      filled++;
+    }
+  }
+  return filled;
+}
+
+function fillAvg(
+  px: Uint8ClampedArray,
+  flags: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  R: number
+): number {
+  // weighted average of known neighbors. Used only when no valid source patch
+  // exists (rare, only for patches wedged inside very large masked regions).
+  let filled = 0;
+  for (let dy = -R; dy <= R; dy++) {
+    const ty = cy + dy;
+    if (ty < 0 || ty >= h) continue;
+    for (let dx = -R; dx <= R; dx++) {
+      const tx = cx + dx;
+      if (tx < 0 || tx >= w) continue;
+      const ti = ty * w + tx;
+      if (!flags[ti]) continue;
+
+      let rSum = 0, gSum = 0, bSum = 0, wSum = 0;
+      const RR = 4;
+      for (let ny = -RR; ny <= RR; ny++) {
+        const yy = ty + ny;
+        if (yy < 0 || yy >= h) continue;
+        for (let nx = -RR; nx <= RR; nx++) {
+          const xx = tx + nx;
+          if (xx < 0 || xx >= w) continue;
+          const ni = yy * w + xx;
+          if (flags[ni]) continue;
+          const d2 = nx * nx + ny * ny;
+          if (d2 > RR * RR) continue;
+          const weight = 1 / (d2 + 0.5);
+          const np = ni << 2;
+          rSum += px[np] * weight;
+          gSum += px[np + 1] * weight;
+          bSum += px[np + 2] * weight;
+          wSum += weight;
+        }
+      }
+      if (wSum > 0) {
+        const tp = ti << 2;
+        px[tp] = rSum / wSum;
+        px[tp + 1] = gSum / wSum;
+        px[tp + 2] = bSum / wSum;
+        px[tp + 3] = 255;
+        flags[ti] = 0;
+        filled++;
+      }
+    }
+  }
+  return filled;
+}
+
+function edgeBlend(
+  px: Uint8ClampedArray,
+  origFlags: Uint8Array,
+  w: number,
+  h: number
+): void {
+  // one-pass 3x3 Gaussian-ish blur confined to masked region to soften seams
+  // between copied patches. Only runs on pixels that were originally masked.
+  const tmp = new Uint8ClampedArray(px.length);
+  tmp.set(px);
+  const kernel = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      if (!origFlags[i]) continue;
+      let r = 0, g = 0, b = 0, wSum = 0, k = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const q = ((y + dy) * w + (x + dx)) << 2;
+          const kv = kernel[k++];
+          r += tmp[q] * kv;
+          g += tmp[q + 1] * kv;
+          b += tmp[q + 2] * kv;
+          wSum += kv;
+        }
+      }
+      const p = i << 2;
+      px[p] = r / wSum;
+      px[p + 1] = g / wSum;
+      px[p + 2] = b / wSum;
     }
   }
 }
@@ -169,14 +310,60 @@ export async function runInpaint(
   const mctx = maskCanvas.getContext("2d", { willReadFrequently: true })!;
   const flags = buildMaskFlags(mctx, w, h);
 
-  let count = 0;
-  for (let i = 0; i < flags.length; i++) if (flags[i]) count++;
-  if (count === 0) return result;
+  let remaining = 0;
+  for (let i = 0; i < flags.length; i++) if (flags[i]) remaining++;
+  if (!remaining) return result;
+  const initialRemaining = remaining;
+
+  const origFlags = new Uint8Array(flags);
 
   const imgData = rctx.getImageData(0, 0, w, h);
-  await fmmFill(imgData.data, flags, w, h, onProgress);
-  smoothFilled(imgData.data, flags, w, h, 2);
+  const px = imgData.data;
+
+  const R = 4;
+
+  let stuckWaves = 0;
+  let wave = 0;
+  while (remaining > 0 && stuckWaves < 3 && wave < 50) {
+    wave++;
+    const boundary = findBoundary(flags, w, h);
+    if (!boundary.length) break;
+
+    const scored: Array<{ idx: number; c: number }> = boundary.map((idx) => ({
+      idx,
+      c: patchConfidence(flags, w, h, idx % w, (idx / w) | 0, R),
+    }));
+    scored.sort((a, b) => b.c - a.c);
+
+    const before = remaining;
+    let processed = 0;
+    for (const s of scored) {
+      if (!flags[s.idx]) continue;
+      const cx = s.idx % w;
+      const cy = (s.idx / w) | 0;
+      const best = findBestPatch(px, flags, w, h, cx, cy, R);
+      if (best) {
+        remaining -= copyPatch(px, flags, w, h, cx, cy, best.bx, best.by, R);
+      } else {
+        remaining -= fillAvg(px, flags, w, h, cx, cy, R);
+      }
+      processed++;
+      if (processed % 48 === 0) {
+        onProgress?.(1 - remaining / initialRemaining);
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+
+    if (remaining >= before) stuckWaves++;
+    else stuckWaves = 0;
+
+    onProgress?.(1 - remaining / initialRemaining);
+    await new Promise((r) => setTimeout(r, 0));
+  }
+
+  edgeBlend(px, origFlags, w, h);
   rctx.putImageData(imgData, 0, 0);
+  onProgress?.(1);
   return result;
 }
 
