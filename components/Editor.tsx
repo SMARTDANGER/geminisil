@@ -402,10 +402,10 @@ export default function Editor({
     return () => window.removeEventListener("keydown", onKey);
   }, [undo, redo, fitToStage, runFix]);
 
-  // `-50%` is applied BEFORE scale so the centering offset scales with the zoom.
-  // (`translate(-50%)` uses the element's *unscaled* size; if it's outermost, a
-  // zoom < 1 overshoots and shoves the image to the top-left.)
-  const frameTransform = `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) translate(-50%, -50%)`;
+  // Centering is handled by `place-items: center` on `.canvas-stage`; we only
+  // apply pan + scale here. Scale pivots around the element center (the default
+  // `transform-origin`), so the scaled frame stays visually centered.
+  const frameTransform = `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`;
 
   const wrapCursor =
     tool === "hand" ? (panning.current ? "grabbing" : "grab") : "none";
@@ -499,14 +499,11 @@ export default function Editor({
           </div>
         )}
 
-        <div
-          className="canvas-stage"
-          style={{ left: "50%", top: "50%", width: 0, height: 0, position: "absolute" }}
-        >
+        <div className="canvas-stage">
           <div
             ref={frameRef}
             className="canvas-frame"
-            style={{ transform: frameTransform, position: "absolute" }}
+            style={{ transform: frameTransform }}
           />
         </div>
 

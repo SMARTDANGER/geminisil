@@ -388,6 +388,7 @@ input, textarea, select { font-family: inherit; }
   inset: 0;
   display: grid;
   place-items: center;
+  pointer-events: none;
 }
 .canvas-frame {
   position: relative;
@@ -397,6 +398,7 @@ input, textarea, select { font-family: inherit; }
   overflow: hidden;
   transform-origin: center center;
   will-change: transform;
+  pointer-events: auto;
 }
 .canvas-frame canvas {
   display: block;
