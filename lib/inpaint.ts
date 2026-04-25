@@ -560,239 +560,6 @@ function readMaskFlags(canvas: HTMLCanvasElement): Uint8Array {
   return out;
 }
 
-// ---------- watermark / reverse-alpha-blend pre-pass ----------
-//
-// For semi-transparent overlays (Gemini logo, AI watermarks):
-//   I = α·W + (1-α)·B     (alpha-composited observation)
-//   B = (I - α·W) / (1-α) (mathematical inverse — preserves underlying texture)
-//
-// Pipeline:
-//   1. estimateBackground() — propagate boundary colors inward via diffusion.
-//      Gives a low-frequency B estimate per masked pixel.
-//   2. estimateWatermarkColor() — sample mask interior away from boundary;
-//      defaults to white if no clear chromatic preference.
-//   3. estimateAlpha() — per-pixel α = projection of (I - B) onto (W - B).
-//   4. Detect: if α is mostly in [0.1, 0.9] and coherent → watermark.
-//   5. Apply reverse blend; pixels with α > 0.92 stay masked for exemplar fill.
-
-function estimateBackground(
-  px: Uint8ClampedArray,
-  mask: Uint8Array,
-  w: number,
-  h: number,
-  iters = 24
-): Float32Array {
-  // initialize: known pixels = their RGB, unknown = 0
-  const bg = new Float32Array(w * h * 3);
-  for (let i = 0, p = 0; i < mask.length; i++, p += 3) {
-    if (!mask[i]) {
-      const q = i << 2;
-      bg[p]     = px[q];
-      bg[p + 1] = px[q + 1];
-      bg[p + 2] = px[q + 2];
-    }
-  }
-  // jacobi-style diffusion: each masked pixel = average of neighbors.
-  // Boundary (known) pixels stay fixed → guides smooth bg into the hole.
-  const tmp = new Float32Array(bg.length);
-  for (let it = 0; it < iters; it++) {
-    tmp.set(bg);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = y * w + x;
-        if (!mask[i]) continue;
-        let r = 0, g = 0, b = 0, n = 0;
-        if (x > 0)     { const q = (i - 1) * 3; r += tmp[q]; g += tmp[q+1]; b += tmp[q+2]; n++; }
-        if (x < w - 1) { const q = (i + 1) * 3; r += tmp[q]; g += tmp[q+1]; b += tmp[q+2]; n++; }
-        if (y > 0)     { const q = (i - w) * 3; r += tmp[q]; g += tmp[q+1]; b += tmp[q+2]; n++; }
-        if (y < h - 1) { const q = (i + w) * 3; r += tmp[q]; g += tmp[q+1]; b += tmp[q+2]; n++; }
-        if (n > 0) {
-          const p = i * 3;
-          bg[p]     = r / n;
-          bg[p + 1] = g / n;
-          bg[p + 2] = b / n;
-        }
-      }
-    }
-  }
-  return bg;
-}
-
-function estimateWatermarkColor(
-  px: Uint8ClampedArray,
-  mask: Uint8Array,
-  bg: Float32Array,
-  w: number,
-  h: number
-): [number, number, number] {
-  // pixels deepest inside mask (max distance from boundary) are dominated by W.
-  // compute distance transform via simple BFS-style two-pass.
-  const dist = new Float32Array(mask.length);
-  for (let i = 0; i < mask.length; i++) dist[i] = mask[i] ? Infinity : 0;
-  // forward
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (!mask[i]) continue;
-      let d = dist[i];
-      if (x > 0)     d = Math.min(d, dist[i - 1] + 1);
-      if (y > 0)     d = Math.min(d, dist[i - w] + 1);
-      dist[i] = d;
-    }
-  }
-  // backward
-  for (let y = h - 1; y >= 0; y--) {
-    for (let x = w - 1; x >= 0; x--) {
-      const i = y * w + x;
-      if (!mask[i]) continue;
-      let d = dist[i];
-      if (x < w - 1) d = Math.min(d, dist[i + 1] + 1);
-      if (y < h - 1) d = Math.min(d, dist[i + w] + 1);
-      dist[i] = d;
-    }
-  }
-
-  let maxDist = 0;
-  for (let i = 0; i < dist.length; i++) if (mask[i] && dist[i] > maxDist) maxDist = dist[i];
-  const thresh = Math.max(1, maxDist * 0.6);
-
-  // average shifted color among deep-interior pixels: extrapolated W candidate.
-  // I = α·W + (1-α)·B → with high α, I ≈ W.
-  let rs = 0, gs = 0, bs = 0, n = 0;
-  for (let i = 0; i < mask.length; i++) {
-    if (!mask[i] || dist[i] < thresh) continue;
-    const q = i << 2;
-    rs += px[q]; gs += px[q + 1]; bs += px[q + 2];
-    n++;
-  }
-  if (n === 0) return [255, 255, 255];
-  const Wr = rs / n, Wg = gs / n, Wb = bs / n;
-
-  // if mean is near-white, snap to white (logos are usually white).
-  // Also clamps low-confidence estimates from tiny masks.
-  const lum = 0.299 * Wr + 0.587 * Wg + 0.114 * Wb;
-  if (lum > 200) return [255, 255, 255];
-  return [Wr, Wg, Wb];
-}
-
-function tryWatermarkRemoval(
-  src: Uint8ClampedArray,
-  mask: Uint8Array,
-  w: number,
-  h: number
-): { applied: boolean; recovered: Uint8ClampedArray; residualMask: Uint8Array } {
-  const recovered = new Uint8ClampedArray(src);
-  const residualMask = new Uint8Array(w * h);
-
-  let maskedCount = 0;
-  for (let i = 0; i < mask.length; i++) if (mask[i]) maskedCount++;
-  // too small or too large to be a watermark
-  if (maskedCount < 32 || maskedCount > mask.length * 0.5) {
-    return { applied: false, recovered, residualMask: new Uint8Array(mask) };
-  }
-
-  const bg = estimateBackground(src, mask, w, h, 32);
-  const [Wr, Wg, Wb] = estimateWatermarkColor(src, mask, bg, w, h);
-
-  // per-pixel alpha + recovered B'
-  const alphas: number[] = [];
-  let coherentVotes = 0;
-  let totalVotes = 0;
-
-  for (let i = 0; i < mask.length; i++) {
-    if (!mask[i]) continue;
-    const q = i << 2;
-    const Ir = src[q], Ig = src[q + 1], Ib = src[q + 2];
-    const p = i * 3;
-    const Br = bg[p], Bg = bg[p + 1], Bb = bg[p + 2];
-
-    // I - B = α(W - B)  →  α = ((I-B)·(W-B)) / ||W-B||²
-    const dWr = Wr - Br, dWg = Wg - Bg, dWb = Wb - Bb;
-    const dIr = Ir - Br, dIg = Ig - Bg, dIb = Ib - Bb;
-    const denom = dWr * dWr + dWg * dWg + dWb * dWb;
-    if (denom < 1e-3) continue;
-    let alpha = (dIr * dWr + dIg * dWg + dIb * dWb) / denom;
-    alpha = Math.max(0, Math.min(1, alpha));
-    alphas.push(alpha);
-
-    // coherence test: how well does I-B align with W-B direction?
-    const magI = Math.hypot(dIr, dIg, dIb);
-    const magW = Math.sqrt(denom);
-    if (magI > 6 && magW > 6) {
-      totalVotes++;
-      const cos = (dIr * dWr + dIg * dWg + dIb * dWb) / (magI * magW);
-      if (cos > 0.7) coherentVotes++;
-    }
-  }
-
-  if (alphas.length === 0) {
-    return { applied: false, recovered, residualMask: new Uint8Array(mask) };
-  }
-
-  // detection criteria:
-  //   - majority of strong-shift pixels point in W's direction (coherent overlay)
-  //   - mean α in semi-transparent range (not opaque object)
-  const meanAlpha = alphas.reduce((s, v) => s + v, 0) / alphas.length;
-  const coherentFrac = totalVotes > 0 ? coherentVotes / totalVotes : 0;
-
-  const isWatermark = coherentFrac > 0.6 && meanAlpha > 0.1 && meanAlpha < 0.92;
-
-  if (!isWatermark) {
-    return { applied: false, recovered, residualMask: new Uint8Array(mask) };
-  }
-
-  // light box-smooth alpha map (3x3) to suppress per-pixel estimation noise
-  const alphaMap = new Float32Array(w * h);
-  let aIdx = 0;
-  for (let i = 0; i < mask.length; i++) {
-    if (!mask[i]) continue;
-    alphaMap[i] = alphas[aIdx++];
-  }
-  const alphaSmooth = new Float32Array(w * h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (!mask[i]) continue;
-      let s = 0, n = 0;
-      for (let dy = -1; dy <= 1; dy++) {
-        const yy = y + dy;
-        if (yy < 0 || yy >= h) continue;
-        for (let dx = -1; dx <= 1; dx++) {
-          const xx = x + dx;
-          if (xx < 0 || xx >= w) continue;
-          const j = yy * w + xx;
-          if (!mask[j]) continue;
-          s += alphaMap[j]; n++;
-        }
-      }
-      alphaSmooth[i] = n > 0 ? s / n : alphaMap[i];
-    }
-  }
-
-  // apply reverse alpha blend
-  const ALPHA_OPAQUE = 0.92;
-  for (let i = 0; i < mask.length; i++) {
-    if (!mask[i]) continue;
-    const a = alphaSmooth[i];
-    if (a >= ALPHA_OPAQUE) {
-      // too opaque to recover — leave for exemplar inpaint
-      residualMask[i] = 1;
-      continue;
-    }
-    const q = i << 2;
-    const inv = 1 / (1 - a);
-    const Br = (src[q]     - a * Wr) * inv;
-    const Bg = (src[q + 1] - a * Wg) * inv;
-    const Bb = (src[q + 2] - a * Wb) * inv;
-    recovered[q]     = Math.max(0, Math.min(255, Br));
-    recovered[q + 1] = Math.max(0, Math.min(255, Bg));
-    recovered[q + 2] = Math.max(0, Math.min(255, Bb));
-    recovered[q + 3] = 255;
-  }
-
-  return { applied: true, recovered, residualMask };
-}
-
 // deterministic xorshift32 — same input → same output, important for replays
 function makeRng(seed: number): () => number {
   let s = seed | 0 || 1;
@@ -814,37 +581,14 @@ export async function runInpaint(opts: InpaintOptions): Promise<HTMLCanvasElemen
   rctx.drawImage(srcCanvas, 0, 0);
 
   const src = readSource(srcCanvas);
-  const originalMask = readMaskFlags(maskCanvas);
+  const mask = readMaskFlags(maskCanvas);
 
   // any masked at all?
   let anyMasked = false;
-  for (let i = 0; i < originalMask.length; i++) if (originalMask[i]) { anyMasked = true; break; }
+  for (let i = 0; i < mask.length; i++) if (mask[i]) { anyMasked = true; break; }
   if (!anyMasked) {
     onProgress?.(1);
     return result;
-  }
-
-  // ---------- Pass 1: try reverse-alpha-blend (semi-transparent overlay) ----------
-  // If detected as a watermark, the underlying texture is recovered exactly via
-  // the alpha-compositing inverse. Pixels too opaque to recover (α > 0.92)
-  // remain in residualMask and get exemplar-inpainted in Pass 2.
-  onProgress?.(0.05);
-  const wm = tryWatermarkRemoval(src.px, originalMask, W, H);
-  let workPx = src.px;
-  let mask = originalMask;
-  if (wm.applied) {
-    workPx = wm.recovered;
-    mask = wm.residualMask;
-    let residualCount = 0;
-    for (let i = 0; i < mask.length; i++) if (mask[i]) residualCount++;
-    if (residualCount === 0) {
-      // pure watermark — done
-      const out = rctx.getImageData(0, 0, W, H);
-      out.data.set(workPx);
-      rctx.putImageData(out, 0, 0);
-      onProgress?.(1);
-      return result;
-    }
   }
 
   // decide pyramid depth from min dimension and hole size
@@ -859,7 +603,7 @@ export async function runInpaint(opts: InpaintOptions): Promise<HTMLCanvasElemen
 
   // build pyramid
   const pyramid: Level[] = [];
-  pyramid.push(buildLevel(workPx, mask, W, H));
+  pyramid.push(buildLevel(src.px, mask, W, H));
   for (let l = 1; l < levels; l++) {
     const prev = pyramid[l - 1];
     const ds = downsample2(prev.px, prev.w, prev.h);
